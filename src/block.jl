@@ -16,91 +16,85 @@ const EOF_BLOCK = vcat(BLOCK_HEADER, [
 # BGZF blocks are no larger than 64 KiB before and after compression.
 const MAX_BLOCK_SIZE = UInt(64 * 1024)
 
-# BGZF_MAX_BLOCK_SIZE minus "margin for safety"
-# NOTE: Data block will become slightly larger after deflation when bytes are
-# randomly distributed.
+# Maximum number of bytes to be compressed at one time. Random bytes usually end up filling
+# a bit more when compressed, so we have a 256 byte margin of safety.
 const SAFE_BLOCK_SIZE = UInt(MAX_BLOCK_SIZE - 256)
 
-struct Block
-    compress_pos::UInt32
-    compress_len::UInt32
-    decompress_pos::UInt32
-    decompress_len::UInt32
-    blocklen::UInt32
-    crc32::UInt32
+mutable struct Block{T}
+	de_compressor::T
+	outdata::Vector{UInt8}
+	indata::Vector{UInt8}
+	task::Task
+	outlen::Int
+	outpos::Int
+	inlen::Int
+	crc32::UInt32
+
+	# This is the offset of the block in the file it's read from
+	offset::Int
 end
 
-function check_eof_block(block::Block, data::Vector{UInt8}, pos::Integer)
-    if view(data, pos:pos+block.blocklen-1) != EOF_BLOCK
+function Block(dc::T) where T <: DE_COMPRESSOR
+	outdata = Vector{UInt8}(undef, MAX_BLOCK_SIZE)
+	indata = similar(outdata)
+
+	# We initialize with a trivial, but completable task for sake of simplicity
+	task = schedule(Task(() -> nothing))
+	return Block{T}(dc, outdata, indata, task, 0, 1, 0, UInt32(0), 0)
+end
+
+isempty(block::Block) = block.outpos > block.outlen
+
+function Base.empty!(block::Block)
+	block.outlen = 0
+	block.outpos = 1
+	block.inlen = 0
+	block.offset = 0
+end
+
+nfull(::Type{Block{Decompressor}}) = MAX_BLOCK_SIZE
+nfull(::Type{Block{Compressor}}) = SAFE_BLOCK_SIZE
+Base.wait(b::Block) = wait(b.task)
+
+function check_eof_block(block::Block{Decompressor})
+    if !iszero(block.inlen)
         bgzferror("No EOF block. Truncated file?")
     end
 end
 
-function decompress!(decompressor::Decompressor, block::Block, outdata::Vector{UInt8}, indata::Vector{UInt8})
-    unsafe_decompress!(Base.HasLength(), decompressor,
-                       pointer(outdata, block.decompress_pos), block.decompress_len,
-                       pointer(indata, block.compress_pos), block.compress_len)
-    
-    actual_crc = unsafe_crc32(pointer(outdata, block.decompress_pos), block.decompress_len)
-    actual_crc == block.crc32 || bgzferror("CRC32 checksum does not match")
+function index!(block::Block{Compressor}, data::Vector{UInt8}, offset::Integer, inlen::Integer)
+	copyto!(block.indata, 1, data, 1, inlen)
+	block.inlen = inlen
+	block.offset = offset + inlen
+	block.outpos = 1
+	return inlen
 end
 
-"Make a new block at pos in data, returning block size"
-function copy_block!(data::Vector{UInt8}, block::Block, pos::Integer)
-    # Header: 18 bytes of header
-    unsafe_copyto!(data, pos, BLOCK_HEADER, 1, 16)
-    unsafe_store!(Ptr{UInt16}(pointer(data, pos + 16)), UInt16(block.blocklen - 1))
-    pos += 18
-
-    # Meat
-    unsafe_copyto!(data, pos, data, block.compress_pos, block.compress_len)
-    pos += block.compress_len
-
-    # Tail
-    unsafe_store!(Ptr{UInt32}(pointer(data, pos)), block.crc32)
-    unsafe_store!(Ptr{UInt32}(pointer(data, pos + 4)), block.decompress_len)
-    pos += 8
-    return block.blocklen
-end
-
-"Compress ith block with uncompressed data length len"
-function compress_block!(compressor::Compressor, indata::Vector{UInt8}, outdata::Vector{UInt8},
-                   i::Integer, len::Integer)
-    # Make room for 18 byte header
-    compress_pos = (i-1) * MAX_BLOCK_SIZE + 18 + 1
-    decompress_pos = (i-1) * SAFE_BLOCK_SIZE + 1
-    compress_len = unsafe_compress!(compressor,
-                   pointer(outdata, compress_pos), MAX_BLOCK_SIZE - 26,
-                   pointer(indata, decompress_pos), len)
-
-    crc = unsafe_crc32(pointer(indata, decompress_pos), len)
-    return Block(compress_pos, compress_len, decompress_pos, len, compress_len+26, crc)
-end
-
-# Read a whole BGZF block from the pointer, into block
-function index!(data::Vector{UInt8}, pos::Integer, lastpos::Integer, decpos::Integer)
+function index!(block::Block{Decompressor}, data::Vector{UInt8}, offset::Integer, inlen::Integer)
+	block.outpos = 1
+	
     # +---+---+---+---+---+---+---+---+---+---+---+---+
     # |ID1|ID2|CM |FLG|     MTIME     |XFL|OS | XLEN  | (more-->)
     # +---+---+---+---+---+---+---+---+---+---+---+---+
-    (pos + 12 - 1) > lastpos && bgzferror("Too small input")
+    inlen < 12 && bgzferror("Too small input")
     @inbounds begin
-        if !((data[pos] == 0x1f) & (data[pos+1] == 0x8b))
+        if !((data[1] == 0x1f) & (data[2] == 0x8b))
             bgzferror("invalid gzip identifier")
-        elseif !(data[pos+2] == 0x08)
+        elseif !(data[3] == 0x08)
             bgzferror("invalid compression method")
-        elseif !(data[pos+3] == 0x04)
+        elseif !(data[4] == 0x04)
             bgzferror("invalid flag")
         end
     end
-    xlen = UInt16(data[pos+10]) | UInt16(data[pos+11]) << 8
-    pos += 12
+    xlen = UInt16(data[11]) | UInt16(data[12]) << 8
 
     # +=================================+
     # |...XLEN bytes of "extra field"...| (more-->)
     # +=================================+
-    (pos + xlen - 1) > lastpos && bgzferror("Too small input")
-    stop = pos + xlen
+    inlen < (12 + xlen) && bgzferror("Too small input")
     bsize = UInt16(0) # size of block - 1
+    pos = 13
+    stop = pos + xlen
     @inbounds while pos < stop
         si1 = data[pos]
         si2 = data[pos+1]
@@ -117,16 +111,53 @@ function index!(data::Vector{UInt8}, pos::Integer, lastpos::Integer, decpos::Int
     if bsize == 0
         bgzferror("no block size")
     end
-    compress_pos = pos
-    compress_len = (bsize + 1) - (12 + xlen + 8)
-    pos += compress_len
-    
+
+	# Size of compressed data
+    block.inlen = bsize - xlen - 19
+
     # +=======================+---+---+---+---+---+---+---+---+
     # |...compressed blocks...|     CRC32     |     ISIZE     |
     # +=======================+---+---+---+---+---+---+---+---+
-    (pos + 8 - 1) > lastpos && bgzferror("Too small input")
-    crc = unsafe_load(Ptr{UInt32}(pointer(data, pos)))
-    isize = unsafe_load(Ptr{UInt32}(pointer(data, pos + 4)))
+    blocksize = bsize + 1
+    block.offset = offset + blocksize
+    inlen < blocksize && bgzferror("Too small input")
+    block.crc32 = unsafe_load(Ptr{UInt32}(pointer(data, bsize - 6)))
+    block.outlen = unsafe_load(Ptr{UInt32}(pointer(data, bsize - 2)))
 
-    return Block(compress_pos, compress_len, decpos, isize, bsize + 1, crc)
+    # Move data
+    copyto!(block.indata, 1, data, 13 + xlen, block.inlen)
+
+    # Copy remaining data
+    copyto!(data, 1, data, blocksize+1, inlen - blocksize)
+    return blocksize
+end
+
+# This does the full transformation from input to output data
+queue!(block::Block) = block.task = @spawn _queue!(block)
+
+function _queue!(block::Block{Compressor})
+	# Meat: The compressed data
+	compress_len = unsafe_compress!(block.de_compressor,
+                   pointer(block.outdata, 19), MAX_BLOCK_SIZE - 26,
+                   pointer(block.indata), block.inlen)
+    block.crc32 = unsafe_crc32(pointer(block.indata), block.inlen)
+    block.outlen = compress_len + 26
+
+    # Header: 18 bytes of header
+    unsafe_copyto!(block.outdata, 1, BLOCK_HEADER, 1, 16)
+    unsafe_store!(Ptr{UInt16}(pointer(block.outdata, 17)), UInt16(block.outlen - 1))
+
+    # Tail: CRC + isize
+    unsafe_store!(Ptr{UInt32}(pointer(block.outdata, 18 + compress_len + 1)), block.crc32)
+    unsafe_store!(Ptr{UInt32}(pointer(block.outdata, 18 + compress_len + 5)), block.inlen % UInt32)
+    block.inlen = 0
+end
+
+function _queue!(block::Block{Decompressor})
+    unsafe_decompress!(Base.HasLength(), block.de_compressor,
+                       pointer(block.outdata), block.outlen,
+                       pointer(block.indata), block.inlen)
+    crc32 = unsafe_crc32(pointer(block.outdata), block.outlen)
+    crc32 != block.crc32 && bgzferror("CRC32 checksum does not match")
+	block.inlen = 0
 end

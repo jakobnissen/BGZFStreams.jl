@@ -15,6 +15,9 @@ import TranscodingStreams:
     Memory,
     Error
 
+import Base.Threads.@spawn
+
+const DE_COMPRESSOR = Union{Compressor, Decompressor}
 
 struct BGZFError <: Exception
     message::String

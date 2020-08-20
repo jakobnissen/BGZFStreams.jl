@@ -105,7 +105,7 @@ function index!(block::Block{Decompressor}, data::Vector{UInt8}, offset::Integer
             if slen != 2
                 bgzferror("invalid subfield length")
             end
-            bsize = unsafe_load(Ptr{UInt16}(pointer(data, pos+4)))
+            bsize = bitload(UInt16, data, pos+4)
         end
         # skip this field
         pos += 4 + slen
@@ -122,14 +122,15 @@ function index!(block::Block{Decompressor}, data::Vector{UInt8}, offset::Integer
     # +=======================+---+---+---+---+---+---+---+---+
     block.blocklen = bsize + 1
     inlen < block.blocklen && bgzferror("Too small input")
-    block.crc32 = unsafe_load(Ptr{UInt32}(pointer(data, block.blocklen - 7)))
-    block.outlen = unsafe_load(Ptr{UInt32}(pointer(data, block.blocklen - 3)))
+
+	block.crc32 = bitload(UInt32, data, block.blocklen - 7)
+    block.outlen = bitload(UInt32, data, block.blocklen - 3)
 
     # Move data
     copyto!(block.indata, 1, data, 13 + xlen, block.inlen)
 
-    # Copy remaining data
-    copyto!(data, 1, data, blocksize+1, inlen - block.blocklen)
+    # Shift remaining data in input buffer if we didn't comsume everything
+    copyto!(data, 1, data, block.blocklen+1, inlen - block.blocklen)
     return block.blocklen
 end
 
@@ -146,11 +147,12 @@ function _queue!(block::Block{Compressor})
 
     # Header: 18 bytes of header
     unsafe_copyto!(block.outdata, 1, BLOCK_HEADER, 1, 16)
-    unsafe_store!(Ptr{UInt16}(pointer(block.outdata, 17)), UInt16(block.outlen - 1))
+	bitstore(UInt16(block.outlen - 1), block.outdata, 17)
 
     # Tail: CRC + isize
-    unsafe_store!(Ptr{UInt32}(pointer(block.outdata, 18 + compress_len + 1)), block.crc32)
-    unsafe_store!(Ptr{UInt32}(pointer(block.outdata, 18 + compress_len + 5)), block.inlen % UInt32)
+	bitstore(block.crc32, block.outdata, 18 + compress_len + 1)
+	bitstore(block.inlen % UInt32, block.outdata, 18 + compress_len + 5)
+	
     block.inlen = 0
 end
 

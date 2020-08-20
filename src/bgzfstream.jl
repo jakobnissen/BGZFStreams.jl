@@ -35,21 +35,7 @@ end
 
 function CompressorCodec(io::IO, nthreads, compresslevel)
 	nthreads < 1 && throw(ArgumentError("Must use at least 1 thread"))
-    buffer = Vector{UInt8}(undef, MAX_BLOCK_SIZE)
-    blocks = [Block(Compressor(compresslevel)) for i in 1:nthreads]
-    return CompressorCodec{typeof(io)}(buffer, blocks, io, 1, 0)
-end
-
-function DecompressorCodec(io::IO, nthreads)
-	nthreads < 1 && throw(ArgumentError("Must use at least 1 thread"))
-	buffer = Vector{UInt8}(undef, MAX_BLOCK_SIZE)
-    blocks = [Block(Decompressor()) for i in 1:nthreads]
-	return DecompressorCodec{typeof(io)}(buffer, blocks, io, 1, 0)
-end
-
-function CompressorCodec(io::IO, nthreads, compresslevel)
-	nthreads < 1 && throw(ArgumentError("Must use at least 1 thread"))
-    buffer = Vector{UInt8}(undef, MAX_BLOCK_SIZE)
+    buffer = Vector{UInt8}(undef, SAFE_BLOCK_SIZE)
     blocks = [Block(Compressor(compresslevel)) for i in 1:nthreads]
     return CompressorCodec{typeof(io)}(buffer, blocks, io, 1, 0)
 end
@@ -65,25 +51,39 @@ nblocks(c::BGZFCodec) = length(c.blocks)
 get_block(c::BGZFCodec) = @inbounds c.blocks[c.index]
 remaining(codec::BGZFCodec{T}) where T = nfull(Block{T}) - codec.bufferlen
 
-"Returns the index of the next nonempty block, or nothing if no block is"
-function next_block_index(codec::BGZFCodec)
-	i = ifelse(codec.index == nblocks(codec), 1, codec.index + 1)
-
-	# We need to wait for the blocks to make sure they're actually empty
-	wait(codec.blocks[i])
-	while isempty(codec.blocks[i])
-		i == codec.index && return nothing
-		i = ifelse(i == nblocks(codec), 1, i + 1)
-		wait(codec.blocks[i])
-	end
-	return i
-end
-
-function last_offset(codec::BGZFCodec)
+function get_offset(codec::BGZFCodec)
     i = codec.index - 1
 	i = ifelse(iszero(i), nblocks(codec), i)
 	block = @inbounds codec.blocks[i]
 	return block.offset + block.blocklen
+end
+
+"""Switches the code to the next block to process, given whether the input stream is eof.
+Returns block index, or nothing if there are no more blocks to process"""
+function increment_block!(codec::BGZFCodec, eof::Bool)
+	# Next block index
+	i = ifelse(codec.index == nblocks(codec), 1, codec.index + 1)
+	
+	# We need to wait for the blocks to make sure they're actually empty
+	wait(codec.blocks[i])
+
+	# If we're at EOF, we don't need to load any data into the blocks, so we
+	# just skip to the next block with data.
+	if eof
+		while isempty(codec.blocks[i])
+
+			# If we have checked all blocks, we have nothing more to do. Just check
+			# for EOF block, and return nothing
+			if i == codec.index
+				codec isa DecompressorCodec && check_eof_block(get_block(codec))
+				return nothing
+			end
+			i = ifelse(i == nblocks(codec), 1, i + 1)
+			wait(codec.blocks[i])
+		end
+	end
+	codec.index = i
+	return i
 end
 
 function reset!(s::BGZFDecompressorStream)
@@ -108,6 +108,7 @@ function Base.seekstart(s::BGZFDecompressorStream)
     seekstart(s.stream)
     reset!(s)
     last(s.blocks).offset = 0
+    return s
 end
 
 function Base.seek(s::BGZFDecompressorStream, v::VirtualOffset)
@@ -123,6 +124,35 @@ function Base.seek(s::BGZFDecompressorStream, v::VirtualOffset)
     end
     s.state.buffer1.bufferpos += (byte_offset % Int - 1)
     return s
+end
+
+function VirtualOffset(s::BGZFDecompressorStream)
+	# This is a little tricky, because the stream's output buffer may buffer an
+	# arbitrary number of blocks, whose offsets we can't all store. So this might
+	# fail (though ususally won't)
+	buffer_length = s.state.buffer1.bufferpos - s.state.buffer1.markpos
+	
+	
+
+    # Loop over blocks, adding up the decompress_len. When that surpasses s.outpos,
+    # we have the right block. We also get the offset within the block this way.
+    # With the block, we can iterate over all block.blocksize to get the block
+    # offset.
+    decompress_len = 0
+    inblock_offset = 0
+    block_offset = first(s.codec.offset)
+    buffer_offset = s.state.buffer1.bufferpos - s.state.buffer1.markpos - 1
+
+    for block in s.codec.blocks
+        if decompress_len + block.decompress_len >= buffer_offset
+            inblock_offset = buffer_offset - decompress_len
+            break
+        else
+            block_offset += block.blocklen
+            decompress_len += block.decompress_len
+        end
+    end
+    return VirtualOffset(block_offset, inblock_offset)
 end
 
 function VirtualOffset(s::BGZFDecompressorStream)
@@ -167,12 +197,13 @@ end
 function _process(codec::BGZFCodec, input, output, error, blocksize)
 	consumed = 0
     block = get_block(codec)
+    eof = iszero(length(input))
 
 	# If we have spare data in the current block, just give that
     isempty(block) || return copy_from_outbuffer(codec, output, consumed)
 
 	# If there is data to be read in, we do that.
-	if !iszero(length(input))
+	if !eof
     	consumed = min(remaining(codec), length(input))
     	unsafe_copyto!(pointer(codec.buffer, codec.bufferlen + 1), input.ptr, consumed)
     	codec.bufferlen += consumed
@@ -185,30 +216,24 @@ function _process(codec::BGZFCodec, input, output, error, blocksize)
     # At this point, if there is any data in the buffer, it must be enough
     # to queue a whole block
     if !iszero(codec.bufferlen)
-    	indexed = index!(block, codec.buffer, get_offset(codec), codec.bufferlen)
-    	codec.bufferlen -= indexed
+    	used_buffer = index!(block, codec.buffer, get_offset(codec), codec.bufferlen)
+    	codec.bufferlen -= used_buffer
     	queue!(block)
     end
 
-    # If there is no more data, we need to go to next nonempty block and retrieve
-    # data from there. This might not be the next block, in case of short files
-	if iszero(length(input))
-    	index = next_block_index(codec)
-    	if index === nothing
-    		codec isa DecompressorCodec && check_eof_block(block)
-    		return (consumed, 0, :end)
-    	end
-    	codec.index = index
+	blockindex = increment_block!(codec, eof)
 
-    # If there is more data, we either have data in next block to read from,
-    # or need to load data into the next block anyway
-    else
-        index = ifelse(codec.index == nblocks(codec), 1, codec.index + 1)
-	    codec.index = index
-	    wait(codec.blocks[index])
-	    return (consumed, 0, :ok)
-    end
-    # Return data from this new block
-    return copy_from_outbuffer(codec, output, consumed)
+	# This happens if there is no block to go to to either load new data or return
+	# existing data. Then we are done.
+	blockindex === nothing && return (0, 0, :end)
+
+	# If next block is empty, it's because we need to load data into it, so we just
+	# return here and wait for _process to be called again so the new block can be
+	# filled
+	if isempty(get_block(codec))
+		return (consumed, 0, :ok)
+	end
+	
+	# Else, the new block has data and we may as well just return that immediately.
+	return copy_from_outbuffer(codec, output, consumed)
 end
-

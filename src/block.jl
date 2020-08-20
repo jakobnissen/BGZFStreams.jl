@@ -28,6 +28,7 @@ mutable struct Block{T}
 	outlen::Int
 	outpos::Int
 	inlen::Int
+	blocklen::Int
 	crc32::UInt32
 
 	# This is the offset of the block in the file it's read from
@@ -39,8 +40,8 @@ function Block(dc::T) where T <: DE_COMPRESSOR
 	indata = similar(outdata)
 
 	# We initialize with a trivial, but completable task for sake of simplicity
-	task = Task(() -> nothing)
-	return Block{T}(dc, outdata, indata, task, 0, 1, 0, UInt32(0), 0)
+	task = schedule(Task(() -> nothing))
+	return Block{T}(dc, outdata, indata, task, 0, 1, 0, 0, UInt32(0), 0)
 end
 
 isempty(block::Block) = block.outpos > block.outlen
@@ -54,25 +55,25 @@ end
 
 nfull(::Type{Block{Decompressor}}) = MAX_BLOCK_SIZE
 nfull(::Type{Block{Compressor}}) = SAFE_BLOCK_SIZE
-remaining(b::Block) = nfull(typeof(b)) - b.inlen
 Base.wait(b::Block) = wait(b.task)
 
-function check_eof_block(block::Block)
-	if view(block.indata, 1:block.inlen) != EOF_BLOCK
+function check_eof_block(block::Block{Decompressor})
+    if !iszero(block.inlen)
         bgzferror("No EOF block. Truncated file?")
     end
 end
 
 function index!(block::Block{Compressor}, data::Vector{UInt8}, offset::Integer, inlen::Integer)
-	unsafe_copyto!(block.indata, 1, data, 1, inlen)
+	copyto!(block.indata, 1, data, 1, inlen)
 	block.inlen = inlen
 	block.offset = offset
 	block.outpos = 1
+	return inlen
 end
 
 function index!(block::Block{Decompressor}, data::Vector{UInt8}, offset::Integer, inlen::Integer)
-	block.offset = offset
 	block.outpos = 1
+	block.offset = offset
 	
     # +---+---+---+---+---+---+---+---+---+---+---+---+
     # |ID1|ID2|CM |FLG|     MTIME     |XFL|OS | XLEN  | (more-->)
@@ -87,7 +88,7 @@ function index!(block::Block{Decompressor}, data::Vector{UInt8}, offset::Integer
             bgzferror("invalid flag")
         end
     end
-    xlen = UInt16(data[11]) | UInt16(data[pos+12]) << 8
+    xlen = UInt16(data[11]) | UInt16(data[12]) << 8
 
     # +=================================+
     # |...XLEN bytes of "extra field"...| (more-->)
@@ -119,12 +120,17 @@ function index!(block::Block{Decompressor}, data::Vector{UInt8}, offset::Integer
     # +=======================+---+---+---+---+---+---+---+---+
     # |...compressed blocks...|     CRC32     |     ISIZE     |
     # +=======================+---+---+---+---+---+---+---+---+
-    inlen < (bsize + 1) && bgzferror("Too small input")
-    block.crc32 = unsafe_load(Ptr{UInt32}(pointer(data, block.inlen - 7)))
-    block.outlen = unsafe_load(Ptr{UInt32}(pointer(data, block.inlen - 3)))
+    block.blocklen = bsize + 1
+    inlen < block.blocklen && bgzferror("Too small input")
+    block.crc32 = unsafe_load(Ptr{UInt32}(pointer(data, block.blocklen - 7)))
+    block.outlen = unsafe_load(Ptr{UInt32}(pointer(data, block.blocklen - 3)))
 
     # Move data
-    unsafe_copyto!(block.indata, 1, data, 13 + xlen, block.inlen)
+    copyto!(block.indata, 1, data, 13 + xlen, block.inlen)
+
+    # Copy remaining data
+    copyto!(data, 1, data, blocksize+1, inlen - block.blocklen)
+    return block.blocklen
 end
 
 # This does the full transformation from input to output data
@@ -152,7 +158,7 @@ function _queue!(block::Block{Decompressor})
     unsafe_decompress!(Base.HasLength(), block.de_compressor,
                        pointer(block.outdata), block.outlen,
                        pointer(block.indata), block.inlen)
-    
+
     crc32 = unsafe_crc32(pointer(block.outdata), block.outlen)
     crc32 != block.crc32 && bgzferror("CRC32 checksum does not match")
 	block.inlen = 0

@@ -2,15 +2,17 @@
 # de/compression threads are launched asyncronously, such that it can de/compress one
 # block while it's reading other blocks
 
-# Todo: Fix seeking code
-# Todo: Fix VirtualOffsets code
-# Todo: Fix tests
-
 mutable struct BGZFCodec{T <: DE_COMPRESSOR, O <: IO} <: TranscodingStreams.Codec
 	buffer::Vector{UInt8}
 	blocks::Vector{Block{T}}
 
-	# We need this in order to write an EOF on end
+	# This has the (offset, decompress_len) of current block at pos 1
+	# then previous blocks. Only used for DecompressorCodec. We use it to
+	# keep track of VirtualOffsets of blocks we may have shipped off to the output
+	# buffer long ago
+	offsets::Vector{Tuple{Int, Int}}
+
+	# We need this in order to write an EOF on end for the CompressorCodec
 	io::O
 
 	# Index of currently used block
@@ -20,8 +22,8 @@ end
 
 const CompressorCodec{O} = BGZFCodec{Compressor, O}
 const DecompressorCodec{O} = BGZFCodec{Decompressor, O}
-const BGZFCompressorStream = TranscodingStream{CompressorCodec}
-const BGZFDecompressorStream = TranscodingStream{DecompressorCodec}
+const BGZFCompressorStream = TranscodingStream{<:CompressorCodec}
+const BGZFDecompressorStream = TranscodingStream{<:DecompressorCodec}
 
 function BGZFCompressorStream(io::IO; nthreads=Threads.nthreads(), compresslevel::Int=6)
     codec = CompressorCodec(io, nthreads, compresslevel)
@@ -37,26 +39,23 @@ function CompressorCodec(io::IO, nthreads, compresslevel)
 	nthreads < 1 && throw(ArgumentError("Must use at least 1 thread"))
     buffer = Vector{UInt8}(undef, SAFE_BLOCK_SIZE)
     blocks = [Block(Compressor(compresslevel)) for i in 1:nthreads]
-    return CompressorCodec{typeof(io)}(buffer, blocks, io, 1, 0)
+    offsets = fill((0,0), 16)
+    return CompressorCodec{typeof(io)}(buffer, blocks, offsets, io, 1, 0)
 end
 
 function DecompressorCodec(io::IO, nthreads)
 	nthreads < 1 && throw(ArgumentError("Must use at least 1 thread"))
 	buffer = Vector{UInt8}(undef, MAX_BLOCK_SIZE)
     blocks = [Block(Decompressor()) for i in 1:nthreads]
-	return DecompressorCodec{typeof(io)}(buffer, blocks, io, 1, 0)
+    offsets = fill((0,0), 16)
+	return DecompressorCodec{typeof(io)}(buffer, blocks, offsets, io, 1, 0)
 end
 
 nblocks(c::BGZFCodec) = length(c.blocks)
 get_block(c::BGZFCodec) = @inbounds c.blocks[c.index]
-remaining(codec::BGZFCodec{T}) where T = nfull(Block{T}) - codec.bufferlen
 
-function get_offset(codec::BGZFCodec)
-    i = codec.index - 1
-	i = ifelse(iszero(i), nblocks(codec), i)
-	block = @inbounds codec.blocks[i]
-	return block.offset + block.blocklen
-end
+"Get number of remaning bytes in the codec's buffer before a new block can be indexed"
+remaining(codec::BGZFCodec{T}) where T = nfull(Block{T}) - codec.bufferlen
 
 """Switches the code to the next block to process, given whether the input stream is eof.
 Returns block index, or nothing if there are no more blocks to process"""
@@ -83,31 +82,48 @@ function increment_block!(codec::BGZFCodec, eof::Bool)
 		end
 	end
 	codec.index = i
+
+	push_offsets!(codec)
 	return i
+end
+
+"Add the current block's offsets and lengths to the codex offset vector"
+function push_offsets!(codec)
+	unsafe_copyto!(codec.offsets, 2, codec.offsets, 1, 15)
+	block = get_block(codec)
+	codec.offsets[1] = (block.offset, block.outlen)
+end
+
+"Get the offset for the soon-to-be indexed block based on the previous block"
+function get_new_offset(codec)
+	i = ifelse(codec.index == 1, nblocks(codec), codec.index - 1)
+	lastblock = @inbounds codec.blocks[i]
+	return lastblock.offset + lastblock.blocklen
 end
 
 function reset!(s::BGZFDecompressorStream)
     TranscodingStreams.initbuffer!(s.state.buffer1)
     TranscodingStreams.initbuffer!(s.state.buffer2)
-	for block in s.blocks
+	for block in s.codec.blocks
 		empty!(block)
 	end
-	s.index = 0
-	s.bufferlen = 0
+	s.codec.index = 1
+	s.codec.bufferlen = 0
+	fill!(s.codec.offsets, (0, 0))
     return s
 end
 
 function Base.seek(s::BGZFDecompressorStream, i::Integer)
-    seek(s.stream, i)
     reset!(s)
-    last(s.blocks).offset = i
+    seek(s.stream, i)
+    last(s.codec.blocks).offset = i
     return s
 end
 
 function Base.seekstart(s::BGZFDecompressorStream)
-    seekstart(s.stream)
     reset!(s)
-    last(s.blocks).offset = 0
+    seekstart(s.stream)
+    last(s.codec.blocks).offset = i
     return s
 end
 
@@ -119,7 +135,7 @@ function Base.seek(s::BGZFDecompressorStream, v::VirtualOffset)
     read(s, UInt8)
 
     # Now advance buffer block_offset minus the one byte we just read
-    if byte_offset ≥ first(s.codec.blocks).decompress_len
+    if byte_offset ≥ get_block(s.codec).outlen
         throw(ArgumentError("Too large offset for block"))
     end
     s.state.buffer1.bufferpos += (byte_offset % Int - 1)
@@ -127,60 +143,34 @@ function Base.seek(s::BGZFDecompressorStream, v::VirtualOffset)
 end
 
 function VirtualOffset(s::BGZFDecompressorStream)
-	# This is a little tricky, because the stream's output buffer may buffer an
-	# arbitrary number of blocks, whose offsets we can't all store. So this might
-	# fail (though ususally won't)
-	buffer_length = s.state.buffer1.bufferpos - s.state.buffer1.markpos
-	
-	
+	# This is a little tricky, because the output buffer may buffer an arbitrary
+	# large amount of blocks, and we can't keep track of all these blocks'
+	# offsets
+	n_buffered = s.state.buffer1.bufferpos - s.state.buffer1.markpos - 1
 
-    # Loop over blocks, adding up the decompress_len. When that surpasses s.outpos,
-    # we have the right block. We also get the offset within the block this way.
-    # With the block, we can iterate over all block.blocksize to get the block
-    # offset.
-    decompress_len = 0
-    inblock_offset = 0
-    block_offset = first(s.codec.offset)
-    buffer_offset = s.state.buffer1.bufferpos - s.state.buffer1.markpos - 1
+	# First we removed the buffered data from the current block
+	n_buffered -= (get_block(s.codec).outpos - 1)
+	blockindex = 1
 
-    for block in s.codec.blocks
-        if decompress_len + block.decompress_len >= buffer_offset
-            inblock_offset = buffer_offset - decompress_len
-            break
-        else
-            block_offset += block.blocklen
-            decompress_len += block.decompress_len
-        end
-    end
-    return VirtualOffset(block_offset, inblock_offset)
-end
+	# Next we backtrace until we reach the correct
+	while n_buffered >= 0
+		blockindex += 1
+		if blockindex > length(s.codec.offsets)
+			bgzferror("Too many blocks buffered to retrace original block offset")
+		end
+		(offset, decompressed) = s.codec.blocks[blockindex]
+		n_buffered -= decompressed
+	end
 
-function VirtualOffset(s::BGZFDecompressorStream)
-    # Loop over blocks, adding up the decompress_len. When that surpasses s.outpos,
-    # we have the right block. We also get the offset within the block this way.
-    # With the block, we can iterate over all block.blocksize to get the block
-    # offset.
-    decompress_len = 0
-    inblock_offset = 0
-    block_offset = first(s.codec.offset)
-    buffer_offset = s.state.buffer1.bufferpos - s.state.buffer1.markpos - 1
-
-    for block in s.codec.blocks
-        if decompress_len + block.decompress_len >= buffer_offset
-            inblock_offset = buffer_offset - decompress_len
-            break
-        else
-            block_offset += block.blocklen
-            decompress_len += block.decompress_len
-        end
-    end
-    return VirtualOffset(block_offset, inblock_offset)
+	offset, decompressed = s.codec.offsets[blockindex]
+	return VirtualOffset(offset, n_buffered + decompressed)
 end
 
 function TranscodingStreams.finalize(codec::CompressorCodec)
     write(codec.io, EOF_BLOCK)
 end
 
+"Return data already prepared in the current block"
 function copy_from_outbuffer(codec::BGZFCodec, output::Memory, consumed::Integer)
 	block = get_block(codec)
 	available = block.outlen - block.outpos + 1
@@ -191,10 +181,6 @@ function copy_from_outbuffer(codec::BGZFCodec, output::Memory, consumed::Integer
 end
 
 function TranscodingStreams.process(codec::BGZFCodec{T}, input::Memory, output::Memory, error::Error) where T
-	return _process(codec, input, output, error, nfull(Block{T}))
-end
-
-function _process(codec::BGZFCodec, input, output, error, blocksize)
 	consumed = 0
     block = get_block(codec)
     eof = iszero(length(input))
@@ -210,14 +196,13 @@ function _process(codec::BGZFCodec, input, output, error, blocksize)
 
 		# If we have read in data, but still not enough to queue a block, return no data
 		# and wait for more data to be passed
-    	codec.bufferlen < blocksize && return (consumed, 0, :ok)
+    	codec.bufferlen < nfull(Block{T}) && return (consumed, 0, :ok)
     end
 
     # At this point, if there is any data in the buffer, it must be enough
-    # to queue a whole block
+    # to queue a whole block (since the buffer is either full, or input is EOF)
     if !iszero(codec.bufferlen)
-    	used_buffer = index!(block, codec.buffer, get_offset(codec), codec.bufferlen)
-    	codec.bufferlen -= used_buffer
+    	used_buffer = index!(codec, block)
     	queue!(block)
     end
 
@@ -228,7 +213,7 @@ function _process(codec::BGZFCodec, input, output, error, blocksize)
 	blockindex === nothing && return (0, 0, :end)
 
 	# If next block is empty, it's because we need to load data into it, so we just
-	# return here and wait for _process to be called again so the new block can be
+	# return here and wait for process to be called again so the new block can be
 	# filled
 	if isempty(get_block(codec))
 		return (consumed, 0, :ok)

@@ -28,11 +28,9 @@ mutable struct Block{T}
 	outlen::Int
 	outpos::Int
 	inlen::Int
+	offset::Int
 	blocklen::Int
 	crc32::UInt32
-
-	# This is the offset of the block in the file it's read from
-	offset::Int
 end
 
 function Block(dc::T) where T <: DE_COMPRESSOR
@@ -41,7 +39,7 @@ function Block(dc::T) where T <: DE_COMPRESSOR
 
 	# We initialize with a trivial, but completable task for sake of simplicity
 	task = schedule(Task(() -> nothing))
-	return Block{T}(dc, outdata, indata, task, 0, 1, 0, 0, UInt32(0), 0)
+	return Block{T}(dc, outdata, indata, task, 0, 1, 0, 0, 0, UInt32(0))
 end
 
 isempty(block::Block) = block.outpos > block.outlen
@@ -50,7 +48,6 @@ function Base.empty!(block::Block)
 	block.outlen = 0
 	block.outpos = 1
 	block.inlen = 0
-	block.offset = 0
 end
 
 nfull(::Type{Block{Decompressor}}) = MAX_BLOCK_SIZE
@@ -63,22 +60,27 @@ function check_eof_block(block::Block{Decompressor})
     end
 end
 
-function index!(block::Block{Compressor}, data::Vector{UInt8}, offset::Integer, inlen::Integer)
-	copyto!(block.indata, 1, data, 1, inlen)
-	block.inlen = inlen
-	block.offset = offset
+"""Prepare the block to be de/compressed. Unlike the queue operation, the indexing
+function may mutate the codec, and is therefore not threadsafe."""
+function index! end
+
+function index!(codec, block::Block{Compressor})
+	copyto!(block.indata, 1, codec.buffer, 1, codec.bufferlen)
+	block.inlen = codec.bufferlen
 	block.outpos = 1
-	return inlen
+	block.offset = get_new_offset(codec)
+	codec.bufferlen = 0
 end
 
-function index!(block::Block{Decompressor}, data::Vector{UInt8}, offset::Integer, inlen::Integer)
+function index!(codec, block::Block{Decompressor})
 	block.outpos = 1
-	block.offset = offset
+	data = codec.buffer
+	block.offset = get_new_offset(codec)
 	
     # +---+---+---+---+---+---+---+---+---+---+---+---+
     # |ID1|ID2|CM |FLG|     MTIME     |XFL|OS | XLEN  | (more-->)
     # +---+---+---+---+---+---+---+---+---+---+---+---+
-    inlen < 12 && bgzferror("Too small input")
+    codec.bufferlen < 12 && bgzferror("Too small input")
     @inbounds begin
         if !((data[1] == 0x1f) & (data[2] == 0x8b))
             bgzferror("invalid gzip identifier")
@@ -93,7 +95,7 @@ function index!(block::Block{Decompressor}, data::Vector{UInt8}, offset::Integer
     # +=================================+
     # |...XLEN bytes of "extra field"...| (more-->)
     # +=================================+
-    inlen < (12 + xlen) && bgzferror("Too small input")
+    codec.bufferlen < (12 + xlen) && bgzferror("Too small input")
     bsize = UInt16(0) # size of block - 1
     pos = 13
     stop = pos + xlen
@@ -121,7 +123,7 @@ function index!(block::Block{Decompressor}, data::Vector{UInt8}, offset::Integer
     # |...compressed blocks...|     CRC32     |     ISIZE     |
     # +=======================+---+---+---+---+---+---+---+---+
     block.blocklen = bsize + 1
-    inlen < block.blocklen && bgzferror("Too small input")
+    codec.bufferlen < block.blocklen && bgzferror("Too small input")
 
 	block.crc32 = bitload(UInt32, data, block.blocklen - 7)
     block.outlen = bitload(UInt32, data, block.blocklen - 3)
@@ -130,11 +132,11 @@ function index!(block::Block{Decompressor}, data::Vector{UInt8}, offset::Integer
     copyto!(block.indata, 1, data, 13 + xlen, block.inlen)
 
     # Shift remaining data in input buffer if we didn't comsume everything
-    copyto!(data, 1, data, block.blocklen+1, inlen - block.blocklen)
-    return block.blocklen
+    copyto!(data, 1, data, block.blocklen+1, codec.bufferlen - block.blocklen)
+    codec.bufferlen -= block.blocklen
 end
 
-# This does the full transformation from input to output data
+"Process the block in another thread"
 queue!(block::Block) = block.task = @spawn _queue!(block)
 
 function _queue!(block::Block{Compressor})
@@ -144,6 +146,7 @@ function _queue!(block::Block{Compressor})
                    pointer(block.indata), block.inlen)
     block.crc32 = unsafe_crc32(pointer(block.indata), block.inlen)
     block.outlen = compress_len + 26
+    block.blocklen = block.outlen
 
     # Header: 18 bytes of header
     unsafe_copyto!(block.outdata, 1, BLOCK_HEADER, 1, 16)

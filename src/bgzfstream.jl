@@ -69,7 +69,7 @@ function last_offset(codec::BGZFCodec)
     i = codec.index - 1
 	i = ifelse(iszero(i), nblocks(codec), i)
 	block = @inbounds codec.blocks[i]
-	return block.offset
+	return block.offset + block.blocklen
 end
 
 function reset!(s::BGZFDecompressorStream)
@@ -78,6 +78,8 @@ function reset!(s::BGZFDecompressorStream)
 	for block in s.blocks
 		empty!(block)
 	end
+	s.index = 0
+	s.bufferlen = 0
     return s
 end
 
@@ -91,6 +93,7 @@ end
 function Base.seekstart(s::BGZFDecompressorStream)
     seekstart(s.stream)
     reset!(s)
+    last(s.blocks).offset = 0
 end
 
 function Base.seek(s::BGZFDecompressorStream, v::VirtualOffset)
@@ -168,7 +171,7 @@ function _process(codec::BGZFCodec, input, output, error, blocksize)
     # At this point, if there is any data in the buffer, it must be enough
     # to queue a whole block
     if !iszero(codec.bufferlen)
-    	indexed = index!(block, codec.buffer, last_offset(codec), codec.bufferlen)
+    	indexed = index!(block, codec.buffer, get_offset(codec), codec.bufferlen)
     	codec.bufferlen -= indexed
     	queue!(block)
     end

@@ -28,6 +28,7 @@ mutable struct Block{T}
 	outlen::Int
 	outpos::Int
 	inlen::Int
+	blocklen::Int
 	crc32::UInt32
 
 	# This is the offset of the block in the file it's read from
@@ -40,7 +41,7 @@ function Block(dc::T) where T <: DE_COMPRESSOR
 
 	# We initialize with a trivial, but completable task for sake of simplicity
 	task = schedule(Task(() -> nothing))
-	return Block{T}(dc, outdata, indata, task, 0, 1, 0, UInt32(0), 0)
+	return Block{T}(dc, outdata, indata, task, 0, 1, 0, 0, UInt32(0), 0)
 end
 
 isempty(block::Block) = block.outpos > block.outlen
@@ -65,13 +66,14 @@ end
 function index!(block::Block{Compressor}, data::Vector{UInt8}, offset::Integer, inlen::Integer)
 	copyto!(block.indata, 1, data, 1, inlen)
 	block.inlen = inlen
-	block.offset = offset + inlen
+	block.offset = offset
 	block.outpos = 1
 	return inlen
 end
 
 function index!(block::Block{Decompressor}, data::Vector{UInt8}, offset::Integer, inlen::Integer)
 	block.outpos = 1
+	block.offset = offset
 	
     # +---+---+---+---+---+---+---+---+---+---+---+---+
     # |ID1|ID2|CM |FLG|     MTIME     |XFL|OS | XLEN  | (more-->)
@@ -118,18 +120,17 @@ function index!(block::Block{Decompressor}, data::Vector{UInt8}, offset::Integer
     # +=======================+---+---+---+---+---+---+---+---+
     # |...compressed blocks...|     CRC32     |     ISIZE     |
     # +=======================+---+---+---+---+---+---+---+---+
-    blocksize = bsize + 1
-    block.offset = offset + blocksize
-    inlen < blocksize && bgzferror("Too small input")
-    block.crc32 = unsafe_load(Ptr{UInt32}(pointer(data, bsize - 6)))
-    block.outlen = unsafe_load(Ptr{UInt32}(pointer(data, bsize - 2)))
+    block.blocklen = bsize + 1
+    inlen < block.blocklen && bgzferror("Too small input")
+    block.crc32 = unsafe_load(Ptr{UInt32}(pointer(data, block.blocklen - 7)))
+    block.outlen = unsafe_load(Ptr{UInt32}(pointer(data, block.blocklen - 3)))
 
     # Move data
     copyto!(block.indata, 1, data, 13 + xlen, block.inlen)
 
     # Copy remaining data
-    copyto!(data, 1, data, blocksize+1, inlen - blocksize)
-    return blocksize
+    copyto!(data, 1, data, blocksize+1, inlen - block.blocklen)
+    return block.blocklen
 end
 
 # This does the full transformation from input to output data

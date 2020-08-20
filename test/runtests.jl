@@ -32,24 +32,80 @@ using Test
     @test_throws ArgumentError VirtualOffset(0, 1 << 16)
 end
 
-@testset "BGZFStream" begin
-    filename = joinpath(dirname(@__FILE__), "bar.bgz")
-    stream = BGZFStream(filename, "r")
+@testset "Basics" begin
+	stream = BGZFDecompressorStream(IOBuffer("foo"))
+	@test stream isa BGZFDecompressorStream
+
+	stream = BGZFCompressorStream(IOBuffer("foo"))
+	@test stream isa BGZFDecompressorStream
+end
+
+@testset "Simple I/O" begin
+	# Reading
+	filename = joinpath(dirname(@__FILE__), "bar.bgz")
+    stream = BGZFDecompressorStream(open(filename))
     @test read(stream, UInt8) === UInt8('b')
     @test read(stream, UInt8) === UInt8('a')
     @test read(stream, UInt8) === UInt8('r')
     @test eof(stream)
+    @test read(stream) == UInt8[]
     @test flush(stream) === nothing
     @test close(stream) === nothing
-    @test string(stream) == "BGZFStream{IOStream}(<mode=read>)"
-    @test_throws ArgumentError read(stream, UInt8)
+    @test_throws EOFError read(stream, UInt8)
+
+	# Writing
+	dump = IOBuffer()
+	stream = BGZFCompressorStream(dump)
+	write(stream, "ba")
+	write(stream, UInt8('r'))
+	close(stream)
+	data = buf.data
+	@test data[1:2] == [0x1f, 0x8b]
+	@test data[end-27:end] == BGZFStreams.EOF_BLOCK
+end
+
+@testset "Larger files" begin
+	
+	
+	
+
+	
+
+# Test basics
+
+# Read bar file
+# test eof
+# test can't read, throws EOF
+
+# Open an empty file
+# check EOF
+# check read returns empty array
+
+# Open write file, write "bar", close
+# test file length is in a small range (54-58 bytes)
+# test EOF block at end
+
+# Open larger file
+# Write data
+# Test length
+# Test EOF
+
+# Round trip
+
+# Working with VirtualOffsets
+
+
+
+@testset "BGZFStream" begin
+    
+    
 
     stream = BGZFStream(filename, "r")
-    data = zeros(Int8, 3)
+    data = zeros(UInt8, 3)
     unsafe_read(stream, pointer(data), 3)
     @test data == UInt8['b', 'a', 'r']
     close(stream)
-    @test_throws ArgumentError unsafe_read(stream, pointer(data), 3)
+    @test_throws EOFError unsafe_read(stream, pointer(data), 3)
 
     open(BGZFStream, filename, "r") do stream
         @test virtualoffset(stream) === VirtualOffset(0, 0)

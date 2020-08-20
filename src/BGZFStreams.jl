@@ -19,6 +19,11 @@ import Base.Threads.@spawn
 
 const DE_COMPRESSOR = Union{Compressor, Decompressor}
 
+"""
+	BGZFError(message::String)
+
+BGZF de/compressor errored with `message` when processing data."
+"""
 struct BGZFError <: Exception
     message::String
 end

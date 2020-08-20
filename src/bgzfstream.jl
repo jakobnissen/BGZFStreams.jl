@@ -2,6 +2,12 @@
 # de/compression threads are launched asyncronously, such that it can de/compress one
 # block while it's reading other blocks
 
+"""
+	BGZFCodec{T, IO} <: Codec
+
+Codec used to compress or decompress data from the input IO source of type `IO`.
+`T` must be `LibDeflate.Compressor` or `LibDeflate.Decompressor`.
+"""
 mutable struct BGZFCodec{T <: DE_COMPRESSOR, O <: IO} <: TranscodingStreams.Codec
 	buffer::Vector{UInt8}
 	blocks::Vector{Block{T}}
@@ -25,11 +31,23 @@ const DecompressorCodec{O} = BGZFCodec{Decompressor, O}
 const BGZFCompressorStream = TranscodingStream{<:CompressorCodec}
 const BGZFDecompressorStream = TranscodingStream{<:DecompressorCodec}
 
+"""
+	BGZFCompressorStream(io::IO; threads=nthreads(), compresslevel=6)
+
+Create a `TranscodingStream` which block-gzip compresses data from the underlying `io` with
+the given `compresslevel`. The stream will compress up to `threads` block concurrently.
+"""
 function BGZFCompressorStream(io::IO; nthreads=Threads.nthreads(), compresslevel::Int=6)
     codec = CompressorCodec(io, nthreads, compresslevel)
     return TranscodingStream(codec, io; bufsize=nfull(Block{Compressor}))
 end
 
+"""
+	BGZFDecompressorStream(io::IO; threads=nthreads())
+
+Create a `TranscodingStream` which decompresses block-gzipped data from the underlying `io`.
+The stream will compress up to `threads` block concurrently.
+"""
 function BGZFDecompressorStream(io::IO; nthreads=Threads.nthreads())
     codec = DecompressorCodec(io, nthreads)
     return TranscodingStream(codec, io; bufsize=nfull(Block{Decompressor}))
@@ -113,20 +131,32 @@ function reset!(s::BGZFDecompressorStream)
     return s
 end
 
-function Base.seek(s::BGZFDecompressorStream, i::Integer)
+function _seek(s::BGZFDecompressorStream, i::Integer)
     reset!(s)
     seek(s.stream, i)
     last(s.codec.blocks).offset = i
     return s
 end
 
+"""
+	seekstart(stream::BGZFDecompressorStream)
+
+Seek the `stream`'s input stream to its beginning, and resets the `stream`.
+"""
 function Base.seekstart(s::BGZFDecompressorStream)
     reset!(s)
     seekstart(s.stream)
-    last(s.codec.blocks).offset = i
+    last(s.codec.blocks).offset = 0
     return s
 end
 
+"""
+	seek(stream::BGZFDecompressorStream, v::VirtualOffset)
+
+Seek `stream` to the given `VirtualOffset` `v`. `v` must be a valid virtual offset for the given
+`stream`, i.e. its coffset must be the offset of a valid BGZF block, and its uoffset must be an
+integer in [0, block_len]. Furthermore, `stream`'s underlying stream must be seekable.
+"""
 function Base.seek(s::BGZFDecompressorStream, v::VirtualOffset)
     block_offset, byte_offset = offsets(v)
     seek(s, block_offset)
@@ -135,13 +165,21 @@ function Base.seek(s::BGZFDecompressorStream, v::VirtualOffset)
     read(s, UInt8)
 
     # Now advance buffer block_offset minus the one byte we just read
-    if byte_offset ≥ get_block(s.codec).outlen
+    if byte_offset > get_block(s.codec).outlen
         throw(ArgumentError("Too large offset for block"))
     end
     s.state.buffer1.bufferpos += (byte_offset % Int - 1)
     return s
 end
 
+"""
+	VirtualOffset(stream::BGZFDecompressorStream)
+
+Obtain the `VirtualOffset` of the curret position of `stream`. If `stream's` input stream is
+seekable, seeking to this offset will leave the stream in an equivalent state to its current state.
+A `BGZFDecompressorStream` only tracks the offset of the 16 previous blocks. If more than 16 blocks
+are stored in `stream`'s output buffer, this operation will fail.
+"""
 function VirtualOffset(s::BGZFDecompressorStream)
 	# This is a little tricky, because the output buffer may buffer an arbitrary
 	# large amount of blocks, and we can't keep track of all these blocks'
